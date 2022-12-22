@@ -1,0 +1,511 @@
+---
+title: "Context-dependent responses of terrestrial invertebrates to anthropogenic nitrogen enrichment: a meta-analysis"
+subtitle: "Electronic supplementary material: example R code for the abundance of arthropods"
+author: "Juan Gallego-Zamorano, Melinda M.J. de Jonge, Katharina Runge, Steven H. Huls, Jiaqi Wang, Mark A.J. Huijbregts, Aafke M. Schipper"
+date: "09-12-2022"
+output:
+  html_document:
+    css: ./style.css
+    df_print: default
+    toc: yes
+    toc_depth: 3
+    toc_float:
+     collapsed: false
+    code_folding: hide
+    number_sections: yes
+    fontsize: 14pt
+  fig_caption: yes
+  latex_engine: xelatex
+  pdf_document: null
+  urlcolor: blue
+
+header-includes:
+- \usepackage[english]{babel}
+- \usepackage{graphics}
+- \usepackage{fancyhdr}
+- \pagestyle{fancy}
+- \fancyfoot[LE,RO]{learning unit 3}
+- \usepackage{dcolumn}
+- \usepackage{here}
+- \usepackage{longtable}
+- \usepackage{caption}
+- \captionsetup{skip=2pt,labelsep=space,justification=justified,singlelinecheck=off}
+- \usepackage{framed}
+- \usepackage{tikz}
+- \usetikzlibrary{shapes,snakes}
+- \usepackage{etoolbox}
+- \BeforeBeginEnvironment{framed}{\begin{minipage}{\linewidth}}
+- \AfterEndEnvironment{framed}{\end{minipage}\par}
+- \usepackage{float}
+- \floatplacement{figure}{H}
+
+---
+
+# Preparation
+
+Read necessary libraries.
+
+```{r message=FALSE, warning=FALSE, include=TRUE}
+library(metafor)
+library(metagear)
+library(tidyverse)
+library(orchaRd)
+library(terra)
+library(sf)
+library(raster)
+library(ggpubr)
+library(tictoc)
+library(plyr)
+library(orchaRd)
+library(rotl)
+library(ape)
+library(corpcor)
+
+```
+
+# Effect size calculation
+## Adjust sample means
+In some treatment or control sites there were zero individuals, therefore, we adjusted the sample means following Pustejovsky (2015) before calculating the effect sizes:
+
+```{r eval=FALSE, include=TRUE}
+# Abundances ####
+dat <- read.csv("../Databases/AbundanceDataset_csv.csv")
+
+# Remove studies with Deposition gradient
+dat <- dat %>% 
+  dplyr::filter(N_Added_Deposited == "Added")
+
+# Filter to get only the treatments and not the controls
+dat <- dat %>% 
+  dplyr::group_by(Source, Study, Control_ID) %>% 
+  dplyr::mutate(ControlYN = case_when(Nitrogen_Added == min(Nitrogen_Added) ~ "Control",
+                                      TRUE ~ "Treatment"))
+datT <- dat %>% 
+  dplyr::filter(ControlYN == "Treatment") %>% 
+  dplyr::ungroup()
+
+# Remove observations where the Control AND the Treatment are 0
+datT <- datT %>% 
+  filter(!(Control_Mean == 0 & Treatment_Mean == 0))
+
+# Remove studies where the control is not 0
+ControlNoZero <- dat %>% 
+  dplyr::filter(ControlYN == "Control") %>% 
+  dplyr::filter(Nitrogen_Added != 0)
+
+ControlNoZero <- unique(ControlNoZero$Study)
+
+datT <- datT %>% 
+  dplyr::filter(!(Study %in% ControlNoZero))
+
+# Correct 0s in the Mean
+datT <- datT %>% 
+  dplyr::mutate(Control_MeanCorrected = case_when(Control_Mean == 0 ~ 1/(2 * Control_N * Control_ScalingConstant),
+                                                  TRUE ~ Control_Mean),
+                Treatment_MeanCorrected = case_when(Treatment_Mean == 0 ~ 1/(2 * Treatment_N * Treatment_ScalingConstant),
+                                                    TRUE ~ Treatment_Mean))
+
+```
+
+## Impute missing SDs
+We imputed a variance estimate based on the "Bracken1992" approach if no variance estimate was reported or if the reported variance was equal to zero. "Bracken1992" method uses the coefficient of variation from all complete cases to impute SDs (Bracken, 1992):
+
+```{r eval=FALSE, include=TRUE}
+# Impute SDs Check SDs that are 0 and convert to NA, better to impute all 0s because it's hard to believe that they are not 0
+datT <- datT %>% 
+  dplyr::mutate(Control_SDCorrected = case_when(Control_SD == 0 ~ NA_real_,
+                                         TRUE ~ Control_SD),
+         Treatment_SDCorrected = case_when(Treatment_SD == 0 ~ NA_real_,
+                                           TRUE ~ Treatment_SD))
+
+# Subset per phylum
+Arth <- datT %>% 
+  dplyr::filter(Phylum %in% "Arthropoda") %>% 
+  as.data.frame()
+
+Nema <- datT %>% 
+  dplyr::filter(Phylum %in% "Nematoda")%>% 
+  as.data.frame()
+
+# Impute missing SDs separately
+# impute_missingness(Arth) # Check missingness
+Arth_imp <- impute_SD(aDataFrame = Arth, columnSDnames = "Control_SDCorrected", columnXnames = "Control_MeanCorrected", method = "Bracken1992")
+
+Arth_imp <- impute_SD(aDataFrame = Arth_imp, columnSDnames = "Treatment_SDCorrected", columnXnames = "Treatment_MeanCorrected", method = "Bracken1992")
+# impute_missingness(Arth_imp) # Check missingness
+
+# Check if there any missing NAs
+nas <- Arth_imp %>% 
+  dplyr::filter(is.na(Control_SDCorrected)) %>% 
+  dplyr::select(Source, contains("Treatment"), contains("Control"))
+
+# impute_missingness(Nema) # Check missingness
+Nema_imp <- impute_SD(aDataFrame = Nema, columnSDnames = "Control_SDCorrected", columnXnames = "Control_MeanCorrected", method = "Bracken1992")
+
+Nema_imp <- impute_SD(aDataFrame = Nema_imp, columnSDnames = "Treatment_SDCorrected", columnXnames = "Treatment_MeanCorrected", method = "Bracken1992")
+# impute_missingness(Nema_imp) # Check missingness
+
+nas <- Nema_imp %>% 
+  dplyr::filter(is.na(Control_SDCorrected) | is.na(Treatment_SDCorrected)) %>% 
+  dplyr::select(Source, contains("Treatment"), contains("Control"))
+
+# Join databases again
+dat <- rbind(Arth_imp, Nema_imp)
+
+
+```
+
+## Calculate effect size
+For each study and N level, we calculated the effect size as the natural logarithm of the response ratio (lnRR), i.e., the natural logarithm of the ratio of the richness and abundance at the treated site (AT) and the richness and abundance at the control site (AC). To account for small sample sizes, we applied a bias correction to the effect sizes according to the Delta method (lnRRΔ) by Lajeunesse, (2015). Moreover, for each effect size lnRRΔ we established a weighting factor as the inverse of the corresponding sampling variance VAR(lnRR∆):
+
+```{r eval=FALSE, include=TRUE}
+# Calculate logRR with bias correction (Delta method according to Lajeunesse 2015)
+dat$Ratio <- dat$Treatment_MeanCorrected/dat$Control_MeanCorrected
+dat$logRR_uncorrected <- log(dat$Ratio)
+dat$logRR <- dat$logRR_uncorrected + 
+  0.5*(((dat$Treatment_SDCorrected^2)/(dat$Treatment_N*(dat$Treatment_MeanCorrected^2))) - ((dat$Control_SDCorrected^2)/(dat$Control_N*(dat$Control_MeanCorrected^2))))
+
+# Calculate Variance
+dat$VAR_uncorrected <- (as.numeric(dat$Treatment_SDCorrected)^2)/(dat$Treatment_N*dat$Treatment_MeanCorrected^2) + (as.numeric(dat$Control_SDCorrected)^2)/(dat$Control_N*dat$Control_MeanCorrected^2)
+dat$VAR <- dat$VAR_uncorrected + 0.5*(((dat$Treatment_SDCorrected^4)/((dat$Treatment_N^2)*(dat$Treatment_MeanCorrected^4))) + ((dat$Control_SDCorrected^4)/((dat$Control_N^2)*(dat$Control_MeanCorrected^4))))
+
+# Save data
+# write.csv(dat, "../Databases/AbundanceDataset_ArthNema_imputed.csv", row.names = FALSE)
+
+```
+
+# Extract environmental data
+We extracted yearly atmospheric N deposition values from the global maps from Ackerman, Chen, & Millet, (2018). We linearly interpolated the values for the missing years in the maps (i.e., 1987-1993, 1997-2003, 2007-2013) to match the yearly N deposition to the year of the experiment. For observations before 1984, we used the atmospheric N deposition value reported for 1984 (4% of all observations). Similarly, we obtained the mean annual temperature and mean annual precipitation of the study period in each source by averaging monthly values for each location from the global Climate Research Unit database, which covers the period 1901-2020 (Harris, Osborn, Jones, & Lister, 2020). We extracted estimates of CEC from the 250‐m resolution global SoilGrids data (Hengl et al., 2017) by averaging values at the soil depths of 0–5, 5–15 and 15–30 cm.
+
+
+```{r eval=FALSE, include=TRUE}
+# CEC ####
+# Read CEC 
+cec <- raster("../Data/SoilGrids/CEC_mean_1k/CEC_mean_0-30_1k.tif")
+
+# Convert data to spatial points
+datsf <- st_as_sf(dat, coords = c("Longitude", "Latitude"), crs = "EPSG:4326", remove = FALSE)
+datsf <- st_transform(datsf, crs(cec)) # make all CRS equal
+
+# Extract CEC values
+datsf$CEC <- terra::extract(cec, datsf)
+
+# Ndep ####
+# Read Ndep 
+ndep <- raster("../Data/NitrogenDepositionGlobal/1984-2015/inorganic_tot_Ndep_kghayr_avrg_1984-2015.tif")
+
+# Extract Ndep values
+datsf$Ndep_1984_2015 <- terra::extract(ndep, datsf)
+
+# Extract Mean annual temperatre (MAT) and Mean annual precipitation (MAP) ####
+# Read MATs per year 
+matsfiles <- list.files("D:/Juan/Desktop/Universidad/PHD/Data/ClimateResearchUnit/MeanYears/TMP/", full.names = T)
+mats <- stack(matsfiles)
+
+# Read PREs (MAP) per year 
+presfiles <- list.files("D:/Juan/Desktop/Universidad/PHD/Data/ClimateResearchUnit/MeanYears/PRE/", full.names = T)
+pres <- stack(presfiles)
+
+# Extract MAT and MAP for the initial and final year and do the mean
+yearsInitial <- sort(unique(datsf$Study_Year_Initial))
+yearsFinal <- sort(unique(datsf$Study_Year_Final))
+
+datsf$CRU_MAT_Initial <- NA
+datsf$CRU_MAT_Final <- NA
+datsf$CRU_MAP_Initial <- NA
+datsf$CRU_MAP_Final <- NA
+
+datsf$UNIQID_Initial <- paste0(datsf$Source,datsf$Study,datsf$Study_Year_Initial)
+datsf$UNIQID_Final <- paste0(datsf$Source,datsf$Study,datsf$Study_Year_Final)
+
+tic("Initial year in:")
+for(i in 1:length(yearsInitial)){
+  dat_i <- datsf %>% filter(Study_Year_Initial %in% yearsInitial[i])
+  
+  year_i <- grep(yearsInitial[i], names(mats))
+  
+  mat_i <- mats[[year_i]]
+  pre_i <- pres[[year_i]]
+  
+  dat_i$CRU_MAT_Initial <- terra::extract(mat_i, dat_i)
+  dat_i$CRU_MAP_Initial <- terra::extract(pre_i, dat_i)
+  
+  datsf[datsf$UNIQID_Initial %in% dat_i$UNIQID_Initial, ]$CRU_MAT_Initial <- dat_i$CRU_MAT_Initial
+  datsf[datsf$UNIQID_Initial %in% dat_i$UNIQID_Initial, ]$CRU_MAP_Initial <- dat_i$CRU_MAP_Initial
+}
+toc()
+
+
+# Final year
+tic("Final year in:")
+for(i in 1:length(yearsFinal)){
+  dat_i <- datsf %>% filter(Study_Year_Final %in% yearsFinal[i])
+  
+  year_i <- grep(yearsFinal[i], names(mats))
+  
+  mat_i <- mats[[year_i]]
+  pre_i <- pres[[year_i]]
+  
+  dat_i$CRU_MAT_Final <- terra::extract(mat_i, dat_i)
+  dat_i$CRU_MAP_Final <- terra::extract(pre_i, dat_i)
+  
+  datsf[datsf$UNIQID_Final %in% dat_i$UNIQID_Final, ]$CRU_MAT_Final <- dat_i$CRU_MAT_Final
+  datsf[datsf$UNIQID_Final %in% dat_i$UNIQID_Final, ]$CRU_MAP_Final <- dat_i$CRU_MAP_Final
+}
+toc()
+
+# Mean between years
+datsf$CRU_MAT_mean <- (datsf$CRU_MAT_Initial+datsf$CRU_MAT_Final)/2
+datsf$CRU_MAP_mean <- (datsf$CRU_MAP_Initial+datsf$CRU_MAP_Final)/2
+
+```
+
+# Meta-analysis
+We performed a random-effects meta-analysis to estimate the overall mean impact of N addition on arthropod and nematode richness and abundance (here exemplified for arthropods abundance), without accounting for the amount of N added or for any moderators. We accounted for various sources of non-independence among effect sizes. First, we accounted for non-independence within publications by adding “Publication” as random intercept. Second, we controlled for non-independence due to multiple treatments per study sharing the same control by using a variance-covariance matrix where the diagonal includes the sampling variances and the off-diagonals of the matrix represent the shared variance (covariance) among the effect sizes due to the common control (Lajeunesse, 2011; Olkin & Gleser, 2009):
+
+```{r}
+# Read data
+dat <- read.csv("../Databases/AbundanceDataset_ArthNema_imputed_Env.csv")
+
+#Subset for the Arthropods with Order
+Arth <- dat %>% 
+  dplyr::filter(Phylum %in% "Arthropoda") 
+
+
+# Function to calculate the var-covar matrix
+calc.vRRDelta <- function(x) {
+  v = matrix((x$Control_SDCorrected[1]^2 / (x$Control_N[1] * x$Control_MeanCorrected[1]^2) + 
+                0.5*(x$Control_SDCorrected[1]^4/(x$Control_N[1]^2*x$Control_MeanCorrected[1]^4))), nrow = nrow(x), ncol = nrow(x))
+  diag(v) = x$VAR
+  return(v)
+} 
+
+# Arrange based on Control ID to calculate properly the var-covar matrix
+Arth <- Arth %>%
+  arrange(Control_ID)
+
+# For Arthropods
+ArthV <- bldiag(lapply(split(Arth, Arth$Control_ID), calc.vRRDelta))
+is.positive.definite(ArthV) # TRUE!
+
+# Create a unique identifier for each effect size, which corresponds to the observational id (i.e. residual variance in the model)
+Arth$RowID <-  1:length(Arth$Source)
+
+# Set the Random Effects
+RandomEffects <- list(~1|RowID, ~1|Source)
+
+# RE model for Arthropods
+Arth_REmodel <- rma.mv(logRR,
+                       V = ArthV, 
+                       data = Arth, 
+                       random = RandomEffects)
+
+summary(Arth_REmodel)
+
+```
+
+# Meta-regressions
+## Calculate phylogeny arthropods
+For the abundance of arthropods we controlled for their phylogenetic non-independence by including a phylogenetic tree at the level of order. We obtained the phylogenetic tree based on the Open Tree Taxonomy (Rees & Cranston, 2017) and the Open Tree of Life (Hinchliff et al., 2015):
+
+
+```{r eval=FALSE, include=TRUE}
+#Subset for the Order
+Arth <- dat %>% 
+  filter(Phylum %in% "Arthropoda")
+
+# Remove observations without Order information
+ArthO <- Arth %>% 
+  drop_na(Order)
+
+# Get unique orders
+orders <- sort(unique(ArthO$Order))
+
+# Match Orders with Open Tree Taxonomy 
+ArthtaxaO <- tnrs_match_names(names = orders)
+
+# Check if any order to fix
+nrow(ArthtaxaO[ArthtaxaO$approximate_match==TRUE,])
+ArthtaxaO[ArthtaxaO$approximate_match==TRUE,]  #### zero order to fix
+
+# exploring which orders return more than one match, and the
+# reasons to make sure we retrieve the correct data.
+ArthtaxaO[ArthtaxaO$number_matches != 1,]  #3
+
+# The names and data are correct
+inspect(ArthtaxaO, taxon_name = "Diplura")
+inspect(ArthtaxaO, taxon_name = "Isopoda")
+inspect(ArthtaxaO, taxon_name = "Sarcoptiformes")
+
+# check synonyms and change name accordingly
+ArthtaxaO[ArthtaxaO$is_synonym==TRUE,] # 0!
+
+# saving the taxonomic data created on the 26th of October to speed the process in the future
+save(ArthtaxaO, file = "./Results/Arthropods/Phylogeny/Arthropod_taxa_Orders_Open_Tree_of_Life.RData")
+
+# Getting the tree corresponding to our taxa
+treeO <- tol_induced_subtree(ott_ids = ArthtaxaO$ott_id, label = "name")
+
+plot(treeO, no.margin = TRUE)
+
+# Check if all the orders are in the Synthetic Tree
+in_tree <- is_in_tree(ott_id(ArthtaxaO))
+in_tree # All TRUE! 
+
+# Dealing with polytomies
+# we can check for the existence of polytomies by running the 
+# following code. If polytomies exist, the output will be 
+# `FALSE`, and vice versa.
+
+is.binary(treeO) # there are some polytomies
+
+# to take care of these polytomies, we are going to use a 
+# randomization approach
+set.seed(111) #making it replicable, at least for this version of R (i.e. v.4.0.2)
+tree_randomOrders <- multi2di(treeO,random=TRUE)
+
+is.binary(tree_randomOrders)
+
+# exploring whether our tree covers all the orders we wanted 
+# it to include, and making sure that the orders names in our 
+# database match those in the tree. We use the following code.
+
+# Change tip labels
+tree_randomOrders$tip.label
+tree_randomOrders$tip.label[tree_randomOrders$tip.label=="Diplura_(order_in_Mandibulata)"]<-"Diplura"
+
+orders[!orders %in% as.character(tree_randomOrders$tip.label)] #listed in our database but not in the tree, 0 orders! (Oribatida should be Sarcoptiformes)
+tree_randomOrders$tip.label[!as.character(tree_randomOrders$tip.label) %in% orders] # listed in the tree but not in our database. 0 orders!
+
+# Final tree
+plot(tree_randomOrders, label.offset =.1, no.margin = TRUE)
+
+
+
+
+```
+
+Moreover we estimated branch lengths following Grafen & Hamilton (1989) and produced the phylogenetic matrix that was used in the meta-regressions:
+
+```{r eval=FALSE, include=TRUE}
+# compute branch lengths of tree
+phylo_branchOrders <- compute.brlen(tree_randomOrders, method = "Grafen", power = 1)
+
+# check tree is ultrametric
+is.ultrametric(phylo_branchOrders) # TRUE
+
+save(phylo_branchOrders, file = "./Results/Arthropods/Phylogeny/arth_tree_Orders_random_branchlength.Rdata")
+
+# Phylogenetic matrix
+# matrix to be included in the models
+arth_phyloOrders_cor <- vcv(phylo_branchOrders, cor = T)
+
+# finally, save matrix for future analyses
+save(arth_phyloOrders_cor, file = "./Results/Arthropods/Phylogeny/arth_phylo_Orders_cor.Rdata")
+
+```
+
+## Run meta-regressions
+Before running the meta-regressions we did some preparations such as calculating the var-covar matrix, log-transforming the continuous variables, and creating categorical explanatory variables:
+
+```{r eval=FALSE, include=TRUE}
+# loading phylogenetic matrix
+load("../Results/Arthropods/Phylogeny/arth_phylo_Orders_cor.Rdata") #arth_phyloOrders_cor
+
+#Subset for the Arthropods with Order
+ArthO <- dat %>% 
+  dplyr::filter(Phylum %in% "Arthropoda") %>% 
+  drop_na(Order)
+
+# Arrange based on Control ID to calculate properly the var-covar matrix
+ArthO <- ArthO %>%
+  arrange(Control_ID)
+
+# Create a unique identifier for each effect size, which corresponds to the observational id (i.e. residual variance in the model)
+ArthO$RowID <-  1:length(ArthO$Source)
+
+
+ArthV <- bldiag(lapply(split(ArthO, ArthO$Control_ID), calc.vRRDelta))
+is.positive.definite(ArthV) # TRUE!
+
+# Assign phylogenetic matrix
+phylocor <- list(Order= arth_phyloOrders_cor)
+
+# Transform continous variables
+ArthO$logNadd <- log10(ArthO$Nitrogen_Added)
+ArthO$logNadd2 <- ArthO$logNadd^2
+
+ArthO$logNdep <- log10(ArthO$Ndep_1984_2015)
+ArthO$logNdep2 <- ArthO$logNdep^2
+
+# Merge Feeding guilds
+
+ArthO <- ArthO %>% 
+  mutate(Feeding_GuildUsed = as.factor(case_when(Feeding_Guild %in% c("Parasite", "Parasitoid", "Plant-parasite")~ "Parasite",
+                                       Feeding_Guild %in% c("Nectar feeders", "Herbivore/Fungivore","Fungi", "Herbivore", "Fungivore")~ "Herbivore-Fungivore",
+                                       Feeding_Guild %in% c("Detrivore")~ "Detritivore",
+                                       Feeding_Guild %in% c("Omnivore", "Predator")~ "Predator-Omnivore",
+                                       TRUE ~ Feeding_Guild)))
+
+table(ArthO$Feeding_GuildUsed)
+
+
+# Habitat variable
+ArthO <- ArthO %>% 
+  mutate(Habitat = case_when(str_detect(Vegetation_Type, "(?i)grass|prair|meadow|Lupinus|Savan|scrub|shrub|Bilberry|heath|Milkweed|marsh|Spartina|Peatland|urban") ~ "Non-Forest",
+                             str_detect(Vegetation_Type, "(?i)forest|tree|pine|fern|Old_second") ~ "Forest", 
+                             str_detect(Vegetation_Type, "(?i)plantat|orchard|tea|crop|agricul|culti|field|wheat|Brussel|Cotton|Sugar Beet|Maize|Switchgrass|Miscanthus|Rosa|Soy") ~ "Cultivated",
+                             TRUE ~ Vegetation_Type))
+table(ArthO$Habitat)
+
+# Create metamorphosis
+table(ArthO$Order)
+
+ArthO <- ArthO %>% 
+  mutate(Metamorphosis = case_when(str_detect(Order, "(?i)Coleoptera|Diptera|Hymenoptera|Lepidoptera|Mecoptera|Neuroptera|Raphidioptera") ~ "Complete",
+                                   str_detect(Order, "(?i)Araneae|Blattodea|Dermaptera|Diplura|Geophilomorpha|Lithobiomorpha|Embioptera|Ephemeroptera|Hemiptera|Isopoda|Mesostigmata|Opiliones|Odonata|Orthoptera|Phasmatodea|Pseudoscorpiones|Psocoptera|Scolopendromorpha|Sarcoptiformes|Tetramerocerata|Thysanoptera|Trombidiformes|Polyxenida|Julida") ~ "Incomplete-Gradual",
+                                   str_detect(Order, "(?i)Entomobryomorpha|Neelipleona|Poduromorpha|Symphypleona|Zygentoma|Protura") ~ "None",
+                                   TRUE ~ Order))
+table(ArthO$Metamorphosis)
+ArthO$Metamorphosis <- as.factor(ArthO$Metamorphosis)
+```
+
+Once all the preparations were complete, we loaded the fixed effects and set the random effects structure.
+```{r eval=FALSE, include=TRUE}
+# load Fixed effects
+FixedEffects <- readRDS('Scripts/FixedEffects_Arthropods_Abundance.rds')
+
+# Create Order ID to control for non-phylogenetic non-independence
+ArthO$OrderID <- ArthO$Order
+
+# Random effects structure
+RandomEffects_Phylo <- list(~1|Order, ~1|RowID, ~ 1|Source, ~1|OrderID)
+
+# Empty list to populate with all the models
+modelsArth_Phylo <- vector(mode = "list", length = length(FixedEffects))
+
+# Run the models
+for(i in 1:length(FixedEffects)){
+
+  tic(paste("Phylo Model",i,"formula-",as.character(FixedEffects[[i]])[2]))
+  modeli <- rma.mv(logRR,
+                   mods = FixedEffects[[i]],
+                   V = ArthV,
+                   data = ArthO,
+                   random = RandomEffects_Phylo,
+                   R = phylocor)
+  toc()
+
+  modelsArth_Phylo[[i]] <- modeli
+}
+
+
+```
+
+
+# R session information
+```{r}
+sessionInfo()
+
+```
+
